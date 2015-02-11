@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	zfs "github.com/flynn/flynn/Godeps/_workspace/src/github.com/mistifyio/go-zfs"
@@ -235,7 +236,30 @@ func (b *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
 	return v2, nil
 }
 
-func (b *Provider) SendSnapshot(vol volume.Volume, output io.Writer) error {
+type zfsHaves struct {
+	snapID string `json:"snap_id"`
+}
+
+/*
+	Returns the set of snapshot UIDs available in this volume's backing dataset.
+*/
+func (b *Provider) ReportHaves(vol volume.Volume) ([]json.RawMessage, error) {
+	zvol, err := b.owns(vol)
+	if err != nil {
+		return nil, err
+	}
+	snapshots, err := zvol.dataset.Snapshots()
+	if err != nil {
+		return nil, err
+	}
+	res := make([]json.RawMessage, 0, len(snapshots))
+	for i, snapshot := range snapshots {
+		res[i] = []byte(fmt.Sprintf("%q", strings.Split(snapshot.Name, "@")[1]))
+	}
+	return res, nil
+}
+
+func (b *Provider) SendSnapshot(vol volume.Volume, haves []json.RawMessage, output io.Writer) error {
 	zvol, err := b.owns(vol)
 	if err != nil {
 		return err
@@ -243,26 +267,53 @@ func (b *Provider) SendSnapshot(vol volume.Volume, output io.Writer) error {
 	if !vol.IsSnapshot() {
 		return fmt.Errorf("can only send a snapshot")
 	}
+	// zfs recv can only really accept snapshots that apply to the current tip
+	latestRemote := ""
+	if haves != nil && len(haves) > 0 {
+		latestRemote = string(haves[len(haves)-1])
+	}
+	// look for intersection of existing snapshots on this volume; if so do incremental
+	parentName := strings.Split(zvol.dataset.Name, "@")[0]
+	parentDataset, err := zfs.GetDataset(parentName)
+	if err != nil {
+		return err
+	}
+	snapshots, err := parentDataset.Snapshots()
+	if err != nil {
+		return err
+	}
+	// we can fly incremental iff the latest snap on the remote is available here
+	useIncremental := false
+	if latestRemote != "" {
+		for _, snap := range snapshots {
+			if strings.Split(snap.Name, "@")[1] == latestRemote {
+				useIncremental = true
+				break
+			}
+		}
+	}
+	// at last, send:
+	if useIncremental {
+		sendCmd := exec.Command("zfs", "send", "-I", latestRemote, zvol.dataset.Name)
+		sendCmd.Stdout = output
+		return sendCmd.Run()
+	}
 	return zvol.dataset.SendSnapshot(output)
 }
 
-func (b *Provider) ReceiveSnapshot(input io.Reader) (volume.Volume, error) {
-	id := random.UUID()
-	v := &zfsVolume{
-		info:      &volume.Info{ID: id},
-		provider:  b,
-		basemount: b.mountPath(id),
-	}
-	var err error
-	v.dataset, err = zfs.ReceiveSnapshot(input, path.Join(b.dataset.Name, id)+"@"+id)
+func (b *Provider) ReceiveSnapshot(vol volume.Volume, input io.Reader) error {
+	zvol, err := b.owns(vol)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := b.mountSnapshot(v); err != nil {
-		return nil, err
+	// recv does the right thing with input either fresh or incremental
+	// recv with the dataset name and no snapshot suffix means the snapshot name from farside is kept
+	// TODO check, might need -F for freshes // FIXME crosscut the whole go-zfs again -.-
+	_, err = zfs.ReceiveSnapshot(input, zvol.dataset.Name)
+	if err != nil {
+		return err
 	}
-	b.volumes[id] = v
-	return v, nil
+	return nil
 }
 
 func (v *zfsVolume) Provider() volume.Provider {
